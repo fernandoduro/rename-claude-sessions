@@ -57,6 +57,7 @@ SKIP_BRANCHES = {"master", "main", "develop", "staging"}
 ACTIVE_THRESHOLD_SECONDS = 300
 DEFAULT_MAX_AGE_DAYS = 5
 CLAUDE_EXCERPT_MAX_CHARS = 3000
+OLLAMA_EXCERPT_MAX_CHARS = 800
 TITLE_TIMEOUT = 45
 DEFAULT_CLAUDE_MODEL = "claude-3-5-haiku-latest"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:1.5b"
@@ -290,23 +291,30 @@ def read_session_metadata(filepath: Path) -> Optional[dict]:
                                 first_text = msg
                 except json.JSONDecodeError:
                     continue
-        # Also check the end of the file for custom-title (it gets appended)
+        # Also check for custom-title beyond the first 50 lines.
+        # Search backwards in growing chunks to find the LAST custom-title
+        # with a customTitle value (ours), even in large active session files.
         if not has_custom_title:
             with open(filepath, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 2048))
-                tail = f.read().decode("utf-8", errors="replace")
-                if '"custom-title"' in tail:
-                    for line in tail.strip().split("\n"):
+                # Search in chunks from the end: 2KB, 32KB, 256KB, then full file
+                for chunk_size in (2048, 32768, 262144, size):
+                    f.seek(max(0, size - chunk_size))
+                    tail = f.read().decode("utf-8", errors="replace")
+                    if '"custom-title"' not in tail:
+                        continue
+                    # Find the last custom-title with a customTitle value
+                    for line in reversed(tail.strip().split("\n")):
                         try:
                             d = json.loads(line)
-                            if d.get("type") == "custom-title":
+                            if d.get("type") == "custom-title" and d.get("customTitle"):
                                 has_custom_title = True
-                                custom_title_value = d.get("customTitle")
+                                custom_title_value = d["customTitle"]
                                 break
                         except json.JSONDecodeError:
                             continue
+                    break  # Found the string in this chunk, no need for larger
     except OSError:
         return None
 
@@ -491,15 +499,15 @@ def _clean_model_title(text: str) -> Optional[str]:
     return None
 
 
-def _title_prompt_from_meta(meta: dict) -> Optional[str]:
+def _title_prompt_from_meta(meta: dict, max_chars: int = CLAUDE_EXCERPT_MAX_CHARS) -> Optional[str]:
     texts = meta.get("allUserTexts") or []
     if not texts:
         return None
     excerpt = "\n".join(texts).strip()
     if not excerpt:
         return None
-    if len(excerpt) > CLAUDE_EXCERPT_MAX_CHARS:
-        excerpt = excerpt[:CLAUDE_EXCERPT_MAX_CHARS] + "…"
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars] + "…"
 
     return (
         "Generate a very short title (5–15 words) for this coding conversation. "
@@ -532,24 +540,25 @@ def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> Optional
 
 
 def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> Optional[str]:
-    """Use ollama run to generate a short title from the first few messages."""
-    prompt = _title_prompt_from_meta(meta)
+    """Use the Ollama REST API to generate a short title from the first few messages."""
+    prompt = _title_prompt_from_meta(meta, max_chars=OLLAMA_EXCERPT_MAX_CHARS)
     if not prompt:
         return None
 
+    url = "http://localhost:11434/api/generate"
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }).encode()
+
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        result = subprocess.run(
-            ["ollama", "run", model, prompt],
-            capture_output=True,
-            text=True,
-            timeout=TITLE_TIMEOUT,
-        )
-        if result.returncode != 0 or not result.stdout:
-            if verbose and result.stderr:
-                print(f"    (ollama: {result.stderr.strip()[:200]})")
-            return None
-        return _clean_model_title(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        with urllib.request.urlopen(req, timeout=TITLE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode())
+        text = body.get("response", "")
+        return _clean_model_title(text)
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, json.JSONDecodeError, OSError) as e:
         if verbose:
             print(f"    (ollama: {e})")
     return None
@@ -758,14 +767,28 @@ def main():
 
         if not force_title and meta["hasCustomTitle"]:
             if index_data and not dry_run and meta.get("customTitleValue"):
+                title_val = meta["customTitleValue"]
+                found = False
                 for entry in index_data.get("entries", []):
-                    if entry.get("sessionId") == meta["sessionId"] and "customTitle" not in entry:
-                        entry["customTitle"] = meta["customTitleValue"]
-                        if index_modified_ref is not None:
-                            index_modified_ref[0] = True
-                        if verbose:
-                            print(f"  SYNC INDEX: {meta['customTitleValue']}")
+                    if entry.get("sessionId") == meta["sessionId"]:
+                        found = True
+                        if entry.get("customTitle") != title_val:
+                            entry["customTitle"] = title_val
+                            if index_modified_ref is not None:
+                                index_modified_ref[0] = True
+                            if verbose:
+                                print(f"  SYNC INDEX: {title_val}")
                         break
+                if not found:
+                    index_data.setdefault("entries", []).append({
+                        "sessionId": meta["sessionId"],
+                        "fullPath": str(session_file),
+                        "customTitle": title_val,
+                    })
+                    if index_modified_ref is not None:
+                        index_modified_ref[0] = True
+                    if verbose:
+                        print(f"  SYNC INDEX (new entry): {title_val}")
             skipped_has_title += 1
             return
 
